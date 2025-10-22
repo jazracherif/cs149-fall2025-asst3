@@ -27,24 +27,48 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 
 __global__ void UpSweep(int* output, int two_dplus1, int two_d, int N){
 
     int i = (blockIdx.x  * blockDim.x  + threadIdx.x) * two_dplus1;
 
-    if (i < N)
-        output[i + two_dplus1-1] += output[i + two_d - 1];
+    if (i + two_dplus1 - 1 < N){
+        output[i + two_dplus1 - 1] += output[i + two_d - 1];
+        printf("[UpSweep] - i:%d, output[%d]= %d, N:%d\n", 
+                i,
+                i + two_dplus1-1, 
+                output[i + two_dplus1-1], 
+                N);
+    }
 
 }
 
 __global__ void DownSweep(int* output, int two_dplus1, int two_d, int N){
     // 
     int i = (blockIdx.x  * blockDim.x  + threadIdx.x) * two_dplus1;
-    if (i < N){
+
+    if (i + two_dplus1 - 1 < N){
         int t = output[i + two_d - 1];
         output[i + two_d - 1] = output[i + two_dplus1 - 1];
         output[i + two_dplus1 - 1] += t;
+        printf("[DownSweep] - idx: %d, output[%d] = %d - output[%d] = %d  - N: %d\n", 
+                i,
+                i + two_dplus1 - 1,
+                output[i + two_dplus1 - 1],
+                i + two_d - 1,
+                output[i + two_d - 1],
+                 N);
     }
 
 }
@@ -82,33 +106,33 @@ void exclusive_scan(int* input, int N, int* result)
 
     // upsweep phase
 
-    printf("exclusive_scan \n");
+    printf("==exclusive_scan \n");
     
     int THREADS_IN_BLOCK = 32;
-    // int NUM_BLOCKS = (N + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK;
-    
+
     for (int two_d = 1; two_d <= N/2; two_d*=2) {
         int two_dplus1 = 2 * two_d;
 
         int NUM_BLOCKS = std::max(1, (N / two_dplus1  + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK);
-
+        printf("\n[Upsweep] - start two_dplus1: %d, two_d: %d, N: %d - NUM_BLOCKS: %d\n", two_dplus1, two_d, N, NUM_BLOCKS);
         // each call will launch fewer blocks of threads 
         UpSweep<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(result, two_dplus1, two_d, N);
-        cudaDeviceSynchronize();
-
+        cudaCheckError(cudaDeviceSynchronize());
     }
 
     // Update last value 
     Update<<<1, 1>>>(result, N-1, 0);
+    cudaCheckError(cudaDeviceSynchronize())
 
     // downsweep phase
     for (int two_d = N/2; two_d >= 1; two_d /= 2) {
         int two_dplus1 = 2 * two_d;
 
         int NUM_BLOCKS = std::max(1, (N / two_dplus1  + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK);
+        printf("\n[DownSweep] start - two_dplus1: %d, two_d: %d, N: %d - NUM_BLOCKS: %d\n", two_dplus1, two_d, N, NUM_BLOCKS);
 
         DownSweep<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(result, two_dplus1, two_d, N);
-        cudaDeviceSynchronize();        
+        cudaCheckError(cudaDeviceSynchronize())
     }
 }
 
@@ -137,16 +161,16 @@ double cudaScan(int* inarray, int* end, int* resultarray)
 
     int rounded_length = nextPow2(end - inarray);
     
-    cudaMalloc((void **)&device_result, sizeof(int) * rounded_length);
-    cudaMalloc((void **)&device_input, sizeof(int) * rounded_length);
+    cudaCheckError(cudaMalloc((void **)&device_result, sizeof(int) * rounded_length))
+    cudaCheckError(cudaMalloc((void **)&device_input, sizeof(int) * rounded_length))
 
     // For convenience, both the input and output vectors on the
     // device are initialized to the input values. This means that
     // students are free to implement an in-place scan on the result
     // vector if desired.  If you do this, you will need to keep this
     // in mind when calling exclusive_scan from find_repeats.
-    cudaMemcpy(device_input, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(device_result, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaCheckError(cudaMemcpy(device_input, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice))
+    cudaCheckError(cudaMemcpy(device_result, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice))
 
     double startTime = CycleTimer::currentSeconds();
 
@@ -156,8 +180,20 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     cudaDeviceSynchronize();
     double endTime = CycleTimer::currentSeconds();
        
-    cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaCheckError(cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost))
 
+    printf("intput: ");
+    for (int i = 0; i < N; i++){
+        printf("%d,", inarray[i]);
+    }
+    printf("\n");
+
+    printf("output: ");
+    for (int i = 0; i < N; i++){
+        printf("%d,", resultarray[i]);
+    }
+    printf("\n");
+    
     double overallDuration = endTime - startTime;
     return overallDuration; 
 }
