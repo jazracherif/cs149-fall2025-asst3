@@ -27,6 +27,32 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+
+
+__global__ void UpSweep(int* output, int two_dplus1, int two_d, int N){
+
+    int i = (blockIdx.x  * blockDim.x  + threadIdx.x) * two_dplus1;
+
+    if (i < N)
+        output[i + two_dplus1-1] += output[i + two_d - 1];
+
+}
+
+__global__ void DownSweep(int* output, int two_dplus1, int two_d, int N){
+    // 
+    int i = (blockIdx.x  * blockDim.x  + threadIdx.x) * two_dplus1;
+    if (i < N){
+        int t = output[i + two_d - 1];
+        output[i + two_d - 1] = output[i + two_dplus1 - 1];
+        output[i + two_dplus1 - 1] += t;
+    }
+
+}
+
+__global__ void Update(int* result, int index, int value){
+  result[index] = value;
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -54,7 +80,36 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    // upsweep phase
 
+    printf("exclusive_scan \n");
+    
+    int THREADS_IN_BLOCK = 32;
+    // int NUM_BLOCKS = (N + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK;
+    
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = 2 * two_d;
+
+        int NUM_BLOCKS = std::max(1, (N / two_dplus1  + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK);
+
+        // each call will launch fewer blocks of threads 
+        UpSweep<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(result, two_dplus1, two_d, N);
+        cudaDeviceSynchronize();
+
+    }
+
+    // Update last value 
+    Update<<<1, 1>>>(result, N-1, 0);
+
+    // downsweep phase
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2 * two_d;
+
+        int NUM_BLOCKS = std::max(1, (N / two_dplus1  + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK);
+
+        DownSweep<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(result, two_dplus1, two_d, N);
+        cudaDeviceSynchronize();        
+    }
 }
 
 
