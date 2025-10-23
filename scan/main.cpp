@@ -160,12 +160,14 @@ int main(int argc, char** argv) {
         // run CPU implementation to check correctness
         cpu_exclusive_scan(inarray, inarray+N, checkarray);
 
+        #ifdef DEBUG_ENABLED
         printf("Expected: ");
         for (int i = 0; i < N; i++) {
             printf("%d,", checkarray[i]);
         }
         printf("\n");
-        
+        #endif
+
         if (useThrust) { 
             printf("Thrust GPU time: %.3f ms\n", 1000.f * cudaTime);
         } else {    
