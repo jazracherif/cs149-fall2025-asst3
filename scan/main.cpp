@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
         for (int i=0; i<3; i++) {
             cudaTime = std::min(cudaTime, cudaFindRepeats(inarray, N, resultarray, &cu_size));
         }
-
+        
         // run CPU implementation to check correctness 
         int serial_size = cpu_find_repeats(inarray, N, checkarray);
 

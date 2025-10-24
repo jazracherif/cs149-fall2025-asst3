@@ -51,7 +51,7 @@ __global__ void UpSweep(int* output, int two_dplus1, int two_d, int N){
 
     if (i + two_dplus1 - 1 < N){
         output[i + two_dplus1 - 1] += output[i + two_d - 1];      
-        DEBUG(printf("[UpSweep] - i:%d, output[%d]= %d, N:%d\n", 
+        DEBUG(printf("[UpSweep] - i: %ld, output[%ld]= %d, N:%d\n", 
                 i,
                 i + two_dplus1-1, 
                 output[i + two_dplus1 - 1], 
@@ -68,7 +68,7 @@ __global__ void DownSweep(int* output, int two_dplus1, int two_d, int N){
         int t = output[i + two_d - 1];
         output[i + two_d - 1] = output[i + two_dplus1 - 1];
         output[i + two_dplus1 - 1] += t;
-        DEBUG(printf("[DownSweep] - idx: %d, output[%d] = %d - output[%d] = %d  - N: %d\n", 
+        DEBUG(printf("[DownSweep] - idx: %ld, output[%ld] = %d - output[%ld] = %d  - N: %d\n", 
                 i,
                 i + two_dplus1 - 1,
                 output[i + two_dplus1 - 1],
@@ -82,6 +82,15 @@ __global__ void DownSweep(int* output, int two_dplus1, int two_d, int N){
 __global__ void Update(int* result, int index, int value){
   result[index] = value;
 }
+
+__global__ void val(int* input, int index, int *out){
+    int i = blockIdx.x  * blockDim.x  + threadIdx.x;
+
+    if (i == 0){
+        out[0] = input[index];
+    }
+}
+
 
 // exclusive_scan --
 //
@@ -121,7 +130,7 @@ void exclusive_scan(int* input, int N, int* result)
         int two_dplus1 = 2 * two_d;
 
         int NUM_BLOCKS = std::max(1, (N / two_dplus1  + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK);
-        printf("\n[Upsweep] - start two_dplus1: %d, two_d: %d, N: %d - NUM_BLOCKS: %d\n", two_dplus1, two_d, N, NUM_BLOCKS);
+        // printf("\n[Upsweep] - start two_dplus1: %d, two_d: %d, N: %d - NUM_BLOCKS: %d\n", two_dplus1, two_d, N, NUM_BLOCKS);
         // each call will launch fewer blocks of threads 
         UpSweep<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(result, two_dplus1, two_d, N);
         cudaCheckError(cudaDeviceSynchronize());
@@ -137,7 +146,7 @@ void exclusive_scan(int* input, int N, int* result)
         int two_dplus1 = 2 * two_d;
 
         int NUM_BLOCKS = std::max(1, (N / two_dplus1  + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK);
-        DEBUG(printf("\n[DownSweep] start - two_dplus1: %d, two_d: %d, N: %d - NUM_BLOCKS: %d\n", two_dplus1, two_d, N, NUM_BLOCKS))
+        // DEBUG(printf("\n[DownSweep] start - two_dplus1: %d, two_d: %d, N: %d - NUM_BLOCKS: %d\n", two_dplus1, two_d, N, NUM_BLOCKS))
 
         DownSweep<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(result, two_dplus1, two_d, N);
         cudaCheckError(cudaDeviceSynchronize())
@@ -156,7 +165,6 @@ double cudaScan(int* inarray, int* end, int* resultarray)
 {
     int* device_result;
     int* device_input;
-    int N = end - inarray;  
 
     // This code rounds the arrays provided to exclusive_scan up
     // to a power of 2, but elements after the end of the original
@@ -191,6 +199,7 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     cudaCheckError(cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost))
 
     #ifdef DEBUG_ENABLED
+    int N = end - inarray;  
     printf("intput: ");
     for (int i = 0; i < N; i++){
         printf("%d,", inarray[i]);
@@ -242,6 +251,25 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void repeats_and_copy(int* input, int* copy, int* output, int N){
+    int i = blockIdx.x  * blockDim.x  + threadIdx.x;
+
+    if (i + 1 < N){
+        output[i] = input[i] == input[i+1];
+        copy[i] = output[i];
+    }
+
+}
+
+__global__ void gather_repeated_values(int* mask, int* segmented_scan, int* output, int N){
+    int i = blockIdx.x  * blockDim.x  + threadIdx.x;
+    if (i + 1 < N){
+        if (mask[i] == 1){
+            output[segmented_scan[i+1]-1] = i;
+        }
+    }
+}
+
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -262,7 +290,58 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    // 1.Run the condition check and mark for each index whether 
+    // subsequent one is the same
+    // 2. run segment scan on the mask
+    // 3. get the max number of value and create an array of that size
+    // 4. check mask array for boundary change and copy the index into position
+    //    value in the mask onto the newly create output array
+
+
+    int THREADS_IN_BLOCK = 32;
+    int NUM_BLOCKS = (length  + THREADS_IN_BLOCK - 1) / THREADS_IN_BLOCK;
+    int rounded_length = nextPow2(length);
+
+    int *mask = NULL;
+    int *scanned_mask_out = NULL;
+
+    cudaCheckError(cudaMalloc((void **)&mask, length * sizeof(int)))
+    cudaCheckError(cudaMalloc((void **)&scanned_mask_out, sizeof(int) * rounded_length))
+
+    // 1. Create the mask
+    // example input = [1,1,2, 1,1]
+    // mask = [1, 0, 0, 1, -]
+    printf("repeats_and_copy\n");
+    repeats_and_copy<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(device_input, scanned_mask_out, mask, length);
+    cudaCheckError(cudaDeviceSynchronize())
+
+    // 2. Run segmented
+    // scanned_mask_out = [0, 1, 0, 0, 2, -]
+
+    printf("exclusive scan\n");
+    exclusive_scan(mask, rounded_length, scanned_mask_out);
+    // 
+    // 3. get the max number at length
+    printf("Get Max value at index: %d\n", length - 1);
+    int output_length;
+    int* output_length_device = NULL;
+    cudaCheckError(cudaMalloc((void **)&output_length_device, sizeof(int)))
+    val<<<1,1>>>(scanned_mask_out, length - 1, output_length_device);
+    cudaCheckError(cudaDeviceSynchronize())
+
+    cudaCheckError(cudaMemcpy(&output_length, output_length_device, sizeof(int), cudaMemcpyDeviceToHost))
+    printf("Got Max output elements: %d\n", output_length);
+
+    // 4. Gather All elements
+    printf("gather repeated elements: %d\n", output_length);
+    gather_repeated_values<<<NUM_BLOCKS, THREADS_IN_BLOCK>>>(mask, scanned_mask_out, device_output, length);
+    cudaCheckError(cudaDeviceSynchronize())
+
+    cudaFree(mask);
+    cudaFree(scanned_mask_out);
+    cudaFree(output_length_device);
+
+    return output_length; 
 }
 
 
@@ -276,6 +355,8 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
     int *device_output;
     int rounded_length = nextPow2(length);
     
+
+        
     cudaMalloc((void **)&device_input, rounded_length * sizeof(int));
     cudaMalloc((void **)&device_output, rounded_length * sizeof(int));
     cudaMemcpy(device_input, input, length * sizeof(int), cudaMemcpyHostToDevice);
@@ -285,7 +366,7 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
     
     int result = find_repeats(device_input, length, device_output);
 
-    cudaDeviceSynchronize();
+    cudaDeviceSynchronize();    
     double endTime = CycleTimer::currentSeconds();
 
     // set output count and results array
@@ -294,6 +375,20 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
 
     cudaFree(device_input);
     cudaFree(device_output);
+
+#ifdef DEBUG_ENABLED
+    printf("Input: ");
+    for (int i = 0; i < length; i++) {
+        printf("%d,", input[i]);
+    }
+    printf("\n");
+
+    printf("Output: ");
+    for (int i = 0; i < result; i++) {
+        printf("%d,", output[i]);
+    }
+    printf("\n");
+#endif    
 
     float duration = endTime - startTime; 
     return duration;

@@ -54,3 +54,12 @@ $(OBJDIR)/%.o: %.cpp
 
 $(OBJDIR)/%.o: %.cu
 		$(NVCC) $< $(NVCCFLAGS) -c -o $@
+
+
+
+profile:
+	  nsys profile --stats=true -t nvtx,cuda -o ./reports/scan_report ./cudaScan -m scan -i random -n 400
+
+nsight_compute:
+	  sudo /usr/local/cuda/bin/ncu -o ./reports/kernel_scan_report ./cudaScan -m scan -i random -n 40
+
