@@ -19,6 +19,23 @@
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
 
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 struct GlobalConstants {
 
     SceneName sceneName;
@@ -647,8 +664,14 @@ CudaRenderer::render2() {
     cudaDeviceSynchronize();
 }
 
+/***
+ * circleIndex: the index of the circle
+ * pixelCenter: current pixel center
+ * p: position of the circle
+ * imagePtr: image
+ */
 __device__ __inline__ void
-shadePixelForCircle(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+shadePixelForCircle(int circleIndex, float2 pixelCenter, float3 p, float4 &existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -696,21 +719,15 @@ shadePixelForCircle(int circleIndex, float2 pixelCenter, float3 p, float4* image
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
-
-    // global memory write
-    *imagePtr = newColor;
+    existingColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    existingColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    existingColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    existingColor.w = alpha + existingColor.w;
 
     // END SHOULD-BE-ATOMIC REGION
 }
 
 __global__ void kernelRenderPixels(int width, int height) {
-
 
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
@@ -718,8 +735,16 @@ __global__ void kernelRenderPixels(int width, int height) {
     if (pixelX > height  || pixelY > width )
         return;
 
-    
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
     // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 existingColor = *imgPtr;
 
     // Go through each circle and apply effect
     for (int index = 0; index < cuConstRendererParams.numCircles; index++){
@@ -727,21 +752,10 @@ __global__ void kernelRenderPixels(int width, int height) {
 
         // read position and radius
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        // float  rad = cuConstRendererParams.radius[index];
-
-        // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);
-        
-        short imageWidth = cuConstRendererParams.imageWidth;
-        short imageHeight = cuConstRendererParams.imageHeight;
-        float invWidth = 1.f / imageWidth;
-        float invHeight = 1.f / imageHeight;
-        
-        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                            invHeight * (static_cast<float>(pixelY) + 0.5f));
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-
-        shadePixelForCircle(index, pixelCenterNorm, p, imgPtr);
+        // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
+        shadePixelForCircle(index, pixelCenterNorm, p, existingColor);
     }
+    *imgPtr = existingColor;
 
 }
 
@@ -752,7 +766,7 @@ void CudaRenderer::render() {
     dim3 gridSize( (image->width + blockSize.x - 1) / blockSize.x, (image->height + blockSize.y - 1) / blockSize.y);
 
     kernelRenderPixels<<<gridSize, blockSize>>>(image->width, image->height);
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize())
 }
 
 
