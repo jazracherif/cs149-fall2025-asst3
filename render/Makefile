@@ -68,3 +68,10 @@ $(OBJDIR)/%.o: %.cpp
 
 $(OBJDIR)/%.o: %.cu
 		$(NVCC) $< $(NVCCFLAGS) -c -o $@
+
+
+profile:
+	  nsys profile --stats=true -t nvtx,cuda -o ./reports/render_report ./render rand10k
+
+nsight_compute:
+	  sudo /usr/local/cuda/bin/ncu -o ./reports/kernel_render_report ./render rand10k

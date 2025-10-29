@@ -13,6 +13,7 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "CycleTimer.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -326,6 +327,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
+    // printf("update circle at pixel x:%f, y: %f - pixelDist: %f, maxDist: %f\n", pixelCenter.x, pixelCenter.y, pixelDist, maxDist);
 
     // circle does not contribute to the image
     if (pixelDist > maxDist)
@@ -365,6 +367,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
+    // printf("update circle at pixel x:%f, y: %f\n", pixelCenter.x, pixelCenter.y);
 
     float4 existingColor = *imagePtr;
     float4 newColor;
@@ -634,7 +637,7 @@ CudaRenderer::advanceAnimation() {
 }
 
 void
-CudaRenderer::render() {
+CudaRenderer::render2() {
 
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
@@ -643,3 +646,113 @@ CudaRenderer::render() {
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
+
+__device__ __inline__ void
+shadePixelForCircle(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = cuConstRendererParams.radius[circleIndex];;
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return;
+
+    float3 rgb;
+    float alpha;
+
+    // there is a non-zero contribution.  Now compute the shading value
+
+    // suggestion: This conditional is in the inner loop.  Although it
+    // will evaluate the same for all threads, there is overhead in
+    // setting up the lane masks etc to implement the conditional.  It
+    // would be wise to perform this logic outside of the loop next in
+    // kernelRenderCircles.  (If feeling good about yourself, you
+    // could use some specialized template magic).
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale = 4.f;
+
+        float normPixelDist = sqrt(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+
+        float maxAlpha = .6f + .4f * (1.f-p.z);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+    } else {
+        // simple: each circle has an assigned color
+        int index3 = 3 * circleIndex;
+        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        alpha = .5f;
+    }
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    // BEGIN SHOULD-BE-ATOMIC REGION
+    // global memory read
+
+    float4 existingColor = *imagePtr;
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.w = alpha + existingColor.w;
+
+    // global memory write
+    *imagePtr = newColor;
+
+    // END SHOULD-BE-ATOMIC REGION
+}
+
+__global__ void kernelRenderPixels(int width, int height) {
+
+
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (pixelX > height  || pixelY > width )
+        return;
+
+    
+    // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
+
+    // Go through each circle and apply effect
+    for (int index = 0; index < cuConstRendererParams.numCircles; index++){
+        int index3 = 3 * index;
+
+        // read position and radius
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        // float  rad = cuConstRendererParams.radius[index];
+
+        // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);
+        
+        short imageWidth = cuConstRendererParams.imageWidth;
+        short imageHeight = cuConstRendererParams.imageHeight;
+        float invWidth = 1.f / imageWidth;
+        float invHeight = 1.f / imageHeight;
+        
+        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                            invHeight * (static_cast<float>(pixelY) + 0.5f));
+        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+        shadePixelForCircle(index, pixelCenterNorm, p, imgPtr);
+    }
+
+}
+
+
+void CudaRenderer::render() {
+    // 256 threads per block is a healthy number
+    dim3 blockSize(16, 16);
+    dim3 gridSize( (image->width + blockSize.x - 1) / blockSize.x, (image->height + blockSize.y - 1) / blockSize.y);
+
+    kernelRenderPixels<<<gridSize, blockSize>>>(image->width, image->height);
+    cudaDeviceSynchronize();
+}
+
+

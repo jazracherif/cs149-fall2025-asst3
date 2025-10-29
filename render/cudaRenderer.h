@@ -36,6 +36,7 @@ class CudaRenderer : public CircleRenderer {
 
   void advanceAnimation();
 
+  void render2();
   void render();
 
   void shadePixel(int circleIndex, float pixelCenterX, float pixelCenterY,
