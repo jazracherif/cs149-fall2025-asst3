@@ -36,11 +36,12 @@ class CudaRenderer : public CircleRenderer {
 
   void advanceAnimation();
 
-  void render2();
+  void renderBase();
+  void renderPixels();
   void render();
 
   void shadePixel(int circleIndex, float pixelCenterX, float pixelCenterY,
-                  float px, float py, float pz, float* pixelData);
+                  float px, floaqt py, float pz, float* pixelData);
 };
 
 #endif

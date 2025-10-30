@@ -654,7 +654,7 @@ CudaRenderer::advanceAnimation() {
 }
 
 void
-CudaRenderer::render2() {
+CudaRenderer::renderBase() {
 
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
@@ -671,13 +671,12 @@ CudaRenderer::render2() {
  * imagePtr: image
  */
 __device__ __inline__ void
-shadePixelForCircle(int circleIndex, float2 pixelCenter, float3 p, float4 &existingColor) {
+shadePixelForCircle(int circleIndex, float2 pixelCenter, float3 p, float rad, float4 &existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -752,15 +751,16 @@ __global__ void kernelRenderPixels(int width, int height) {
 
         // read position and radius
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float rad = cuConstRendererParams.radius[index];;
+
         // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
-        shadePixelForCircle(index, pixelCenterNorm, p, existingColor);
+        shadePixelForCircle(index, pixelCenterNorm, p, rad, existingColor);
     }
     *imgPtr = existingColor;
 
 }
 
-
-void CudaRenderer::render() {
+void CudaRenderer::renderPixels() {
     // 256 threads per block is a healthy number
     dim3 blockSize(16, 16);
     dim3 gridSize( (image->width + blockSize.x - 1) / blockSize.x, (image->height + blockSize.y - 1) / blockSize.y);
@@ -769,4 +769,230 @@ void CudaRenderer::render() {
     cudaCheckError(cudaDeviceSynchronize())
 }
 
+
+// __device__ __inline__ int
+// pixelInCircle(float2* circleCenter, float  maxDist, float2 pixelCenter) {
+//     float diffX = circleCenter.x - pixelCenter.x;
+//     float diffY = circleCenter.y - pixelCenter.y;
+//     float pixelDist = diffX * diffX + diffY * diffY;
+
+//     return pixelDist > maxDist ? 0: 1;
+// }
+
+/**
+ * this kernel computes the ordering of BLOCK Size consecutive circles in the circle list
+ * where each block corresponds to a non overlapping 2d box in the image.
+ *
+ * shared memory contains the max on whether the BLOCKSIZE number of circle are contained inside the 
+ * it
+ * 
+ * One it is constructed, each pixel in the block will only try to apply the effect from those circles
+ * 
+//  */
+// __global__ void kernelRenderPixelsBlocks(int circle_start, int BLOCKSIZE, uint* output, int num_circles){
+//     // each thread is a block of size (1024)
+//     __shared__ float3 __circles[BLOCKSIZE]; 
+//     __shared__ uint __prefixSumInput[BLOCKSIZE];
+//     __shared__ uint __prefixSumOutput[BLOCKSIZE];
+//     __shared__ uint __prefixSumScratch[2 * BLOCKSIZE];
+
+//     int block_id = blockIdx.x;
+
+//     // get box dimensions, top/bottom/left/right. Each thread of thre block identify a circle
+//     float boxL, boxR, boxT, boxB;
+
+//     short imageWidth = cuConstRendererParams.imageWidth;
+//     short imageHeight = cuConstRendererParams.imageHeight;
+//     float invWidth = 1.f / imageWidth;
+//     float invHeight = 1.f / imageHeight;
+
+
+//     // linear thread is used to access BLOCK SIZE consecutive amount of shared memory within a thread Block
+//     int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
+
+//     // for each blockID (which is a box, check for circle that interset)
+//     // the next BLOCK SIZE amount of circles
+//     int circle_index = circle_start + threadIdx.x;
+//     if (circle_index > &cuConstRendererParams.numCircles)
+//         return;
+
+//     int index3 = 3 * circle_index;
+//     __circles[circle_index] = *(float3*)(&cuConstRendererParams.position[index3]);
+
+//     float circleX = __circles[threadIdx.x].x;
+//     float circleY = __circles[threadIdx.x].y;
+//     float circleRadius = cuConstRendererParams.radius[circleIndex];;
+
+//     // set whether the circle is in the current Box 
+//     __prefixSumInput[linearThreadIndex % BLOCKSIZE] = circleInBoxConservative(circleX, circleY, circleRadius, boxL,  boxR,  boxT,  boxB)
+
+//     // prefixSum input is ready to be scanned
+//     __syncthreads__();
+    
+//     // sharedMemExclusiveScan(linearThreadIndex, __prefixSumInput, __prefixSumOutput, __prefixSumScratch, BLOCKSIZE);
+
+//     // __syncthreads__();
+
+//     // At this point, all threads in this block have a mask (__prefixSumOutput) indicated which of the circles 
+//     // has an impact on the pixel.
+
+//     // float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * )];
+
+
+//     // if(__prefixSumInput[__circles[circle_index]] == 1){
+//     //     // 
+//     //     shadePixelForCircle(circleIndex, float2 pixelCenter, __circles[circle_index], float4 &existingColor) {
+
+//     // }
+
+//     // float4 existingColor = *imgPtr;
+
+//     // // Go through each circle and apply effect
+//     // for (int index = 0; index < cuConstRendererParams.numCircles; index++){
+//     //     int index3 = 3 * index;
+
+//     //     // read position and radius
+//     //     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+//     //     // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
+//     //     shadePixelForCircle(index, pixelCenterNorm, p, existingColor);
+//     // }
+//     // *imgPtr = existingColor;
+
+
+//     // 1024 circles have been order for this box
+    
+
+
+//     // // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
+//     // float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+//     //                                     invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+//     // // each pixel works on the same first BLOCKSIZE circles. 
+//     // // for 
+//     // // each thread updates infromation about the circle
+//     // if (linearThreadIndex < BLOCKSIZE)
+//     //     circles[linearThreadIndex] = *(float3*)(&cuConstRendererParams.position[index3]);
+
+//     // __syncthreads__();
+
+//     // //
+//     // // is this pixel in one of the circles?
+//     // __shared__ uint prefixSumInput[BLOCKSIZE];
+//     // __shared__ uint prefixSumOutput[BLOCKSIZE];
+//     // __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+
+//     // for (int i = start; i < std::min(cuConstRendererParams.numCircles, start + BLOCKSIZE); i++){
+//     //     float rad = cuConstRendererParams.radius[circleIndex];;
+//     //     prefixSumInput[i] = pixelInCircle(circles[linearThreadIndex], pixelCenter, rad * rad);
+//     //     prefixSumOutput[i] = prefixSumInput[i];
+//     // }
+
+//     // __syncthreads__();
+
+//     // // Exclusive scan must run within the same thread block data. One thread block corresponds to 
+//     // // C circles for 1 pixel. We want 
+//     // sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
+
+//     // __syncthreads__();
+
+
+
+
+//     // // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
+//     // shadePixelForCircle(index, pixelCenterNorm, p, existingColor);
+
+// }
+
+
+// void CudaRenderer::render3() {
+
+//     int N = image->width * image->height;
+//     int PixelPerBox = 10;
+//     int numberOfBoxes = (N + 1) / PixelPerBox;
+
+//     int CIRCLES_PER_BOX = std::min(1024, num_circles);
+//     dim3 blockDim(CIRCLES_PER_BOX, 1);
+//     dim3 gridDim( (numberOfBoxes * CIRCLES_PER_BOX  + blockDim.x - 1) / blockDim.x, 1);
+
+//     // take up the first 1024 circles, update all pixels
+
+//     for (int i=0; i < (num_circles + 1) / blockDim.x; i++){
+//         // apply the effect of first N circles in increment of 1024 across all pixels
+//         uint* output;
+//         cudaMalloc(&output, sizeof(uint)* numberOfBoxes * CIRCLES_PER_BOX);
+
+//         kernelRenderPixelsBlocks<<<gridSize, blockSize>>>(i * CIRCLES_PER_BOX,
+//                                                          CIRCLES_PER_BOX, 
+//                                                          output);
+
+//         // for each blcok                                                  
+//     }
+    
+//     cudaCheckError(cudaDeviceSynchronize())
+// }
+
+__global__ void kernelRenderPixelsWithCache(int imageWidth, int imageHeigh, int circleStart, int circleEnd) {
+
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (pixelX > height  || pixelY > width )
+        return;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 existingColor = *imgPtr;
+
+    __shared__ float3[1024] circles_positions;
+    __shared__ float3[1024] circles_radius;
+
+    int circle_index = std::min(circleEnd, circleStart + blockIdx.x);
+    int index3 = 3 * circle_index;
+
+    circles_positions[circle_index] = *(float3*)(&cuConstRendererParams.position[index3]);
+    circles_radius[circle_index] = cuConstRendererParams.radius[circle_index];;
+
+    __syncthreads__();
+
+    // Each pixel can now apply shaders using 
+    // Go through each circle and apply effect
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 existingColor = *imgPtr;
+
+    // Go through each circle and apply effect
+    for (int circle_id = circleStart; circle_id < circleEnd; circle_id++){
+        int index3 = 3 * circle_id;
+
+        // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
+        shadePixelForCircle(circle_id, pixelCenterNorm, circles_positions[circle_id % 1024], circles_radius[circle_id % 1024], existingColor);
+    }
+
+    *imgPtr = existingColor;
+}
+
+
+void CudaRenderer::render() {
+    int max_circle_per_iterations = 1024;
+    int N = image->width * image->height;
+    dim3 blockDim(max_circle_per_iterations, 1);
+    dim3 gridDim( (N  + blockDim.x - 1) / blockDim.x, 1);
+
+    // take up the first 1024 circles, update all pixels
+    int circleEnd= 0;
+    for (int circlesStart=0; i <  num_circles; circlesStart+= max_circle_per_iterations){
+        circleEnd = std::min(num_circles, circlesStart + max_circle_per_iterations);
+
+        // apply the effect of first N circles in increment of 1024 across all pixels
+        kernelRenderPixelsWithCache<<<gridSize, blockSize>>>(image->width, image->height, circlesStart, circleEnd);
+        // for each blcok                                                  
+    }
+    
+    cudaCheckError(cudaDeviceSynchronize())
+}
 
