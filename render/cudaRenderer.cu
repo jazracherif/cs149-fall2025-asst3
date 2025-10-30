@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <vector>
+#include <algorithm>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -931,13 +932,15 @@ void CudaRenderer::renderPixels() {
 //     cudaCheckError(cudaDeviceSynchronize())
 // }
 
-__global__ void kernelRenderPixelsWithCache(int imageWidth, int imageHeigh, int circleStart, int circleEnd) {
+__global__ void kernelRenderPixelsWithCache(int num_pixels, int imageWidth, int imageHeight, int circleStart, int circleEnd, int num_circles) {
 
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (pixelX > height  || pixelY > width )
+    if (index > num_pixels)
         return;
+
+    int pixelX = index / imageWidth;
+    int pixelY = index % imageWidth;
 
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
@@ -945,32 +948,39 @@ __global__ void kernelRenderPixelsWithCache(int imageWidth, int imageHeigh, int 
     // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-    float4 existingColor = *imgPtr;
 
-    __shared__ float3[1024] circles_positions;
-    __shared__ float3[1024] circles_radius;
+    __shared__ float3 circles_positions[1024];
+    __shared__ float circles_radius[1024];
 
-    int circle_index = std::min(circleEnd, circleStart + blockIdx.x);
+    int circle_index = circleStart + threadIdx.x;
     int index3 = 3 * circle_index;
 
-    circles_positions[circle_index] = *(float3*)(&cuConstRendererParams.position[index3]);
-    circles_radius[circle_index] = cuConstRendererParams.radius[circle_index];;
+    // printf("circle_index: %d\n", circle_index);
 
-    __syncthreads__();
+    if (circle_index < num_circles){
+        circles_positions[circle_index] = *(float3*)(&cuConstRendererParams.position[index3]);
+        circles_radius[circle_index] = cuConstRendererParams.radius[circle_index];;     
+    }
+
+    __syncthreads();
+    // now each pixel should iterate over all circle in the shared data list and update the imagePtr values
+
+    // printf("Apply effect of circles from %d to %d for pixel (%d,%d) \n", circleStart, circleEnd, pixelX, pixelY);
 
     // Each pixel can now apply shaders using 
-    // Go through each circle and apply effect
-
+    // Go through each circle and apply effect   
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     float4 existingColor = *imgPtr;
 
     // Go through each circle and apply effect
-    for (int circle_id = circleStart; circle_id < circleEnd; circle_id++){
-        int index3 = 3 * circle_id;
-
-        // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
-        shadePixelForCircle(circle_id, pixelCenterNorm, circles_positions[circle_id % 1024], circles_radius[circle_id % 1024], existingColor);
+    for (int circle_id = circleStart; circle_id < min(num_circles, circleEnd); circle_id++){
+        // printf("update circle at shared pixel circle %d, x:%d, y: %d \n", circle_id - circleStart, pixelX, pixelY);        
+        shadePixelForCircle(circle_id, 
+                            pixelCenterNorm, 
+                            circles_positions[circle_id - circleStart], 
+                            circles_radius[circle_id - circleStart], 
+                            existingColor);
+        continue;
     }
 
     *imgPtr = existingColor;
@@ -985,11 +995,12 @@ void CudaRenderer::render() {
 
     // take up the first 1024 circles, update all pixels
     int circleEnd= 0;
-    for (int circlesStart=0; i <  num_circles; circlesStart+= max_circle_per_iterations){
-        circleEnd = std::min(num_circles, circlesStart + max_circle_per_iterations);
+    for (int circleStart=0; circleStart < numCircles; circleStart+= max_circle_per_iterations){
+        circleEnd = std::min(numCircles, circleStart + max_circle_per_iterations);
 
         // apply the effect of first N circles in increment of 1024 across all pixels
-        kernelRenderPixelsWithCache<<<gridSize, blockSize>>>(image->width, image->height, circlesStart, circleEnd);
+        printf("Launch kernel for circles from %d to %d\n", circleStart, circleEnd);
+        kernelRenderPixelsWithCache<<<gridDim, blockDim>>>(N, image->width, image->height, circleStart, circleEnd, numCircles);
         // for each blcok                                                  
     }
     
