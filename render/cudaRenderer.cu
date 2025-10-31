@@ -932,22 +932,19 @@ void CudaRenderer::renderPixels() {
 //     cudaCheckError(cudaDeviceSynchronize())
 // }
 
-__global__ void kernelRenderPixelsWithCache(int num_pixels, int imageWidth, int imageHeight, int circleStart, int circleEnd, int num_circles) {
+__global__ void kernelRenderPixelsWithCache(int imageWidth, int imageHeight, int circleStart, int circleEnd, int num_circles) {
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (index > num_pixels)
+    if (pixelX > imageHeight  || pixelY > imageWidth )
         return;
 
-    int pixelX = index / imageWidth;
-    int pixelY = index % imageWidth;
 
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
     // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
 
     __shared__ float3 circles_positions[1024];
     __shared__ float circles_radius[1024];
@@ -955,32 +952,42 @@ __global__ void kernelRenderPixelsWithCache(int num_pixels, int imageWidth, int 
     int circle_index = circleStart + threadIdx.x;
     int index3 = 3 * circle_index;
 
-    // printf("circle_index: %d\n", circle_index);
 
     if (circle_index < num_circles){
-        circles_positions[circle_index] = *(float3*)(&cuConstRendererParams.position[index3]);
-        circles_radius[circle_index] = cuConstRendererParams.radius[circle_index];;     
+        circles_positions[threadIdx.x] = *(float3*)(&cuConstRendererParams.position[index3]);
+        circles_radius[threadIdx.x] = cuConstRendererParams.radius[circle_index];;     
     }
 
     __syncthreads();
+
+    // if (pixelX == 16 && pixelY ==30){
+    // // if (pixelX == 16){
+    //     for (int i =0; i < (circleEnd - circleStart); i++){
+    //         printf("-- circle_index %d - circles_positions: %f - radius %f\n", circle_index, circles_positions[i].x, circles_radius[i]);
+    //     }
+    // }
+
+    
     // now each pixel should iterate over all circle in the shared data list and update the imagePtr values
 
     // printf("Apply effect of circles from %d to %d for pixel (%d,%d) \n", circleStart, circleEnd, pixelX, pixelY);
 
     // Each pixel can now apply shaders using 
-    // Go through each circle and apply effect   
+    // Go through each circle and apply effect  
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
+
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     float4 existingColor = *imgPtr;
 
     // Go through each circle and apply effect
-    for (int circle_id = circleStart; circle_id < min(num_circles, circleEnd); circle_id++){
+    for (int i = 0; i < (circleEnd - circleStart); i++){
         // printf("update circle at shared pixel circle %d, x:%d, y: %d \n", circle_id - circleStart, pixelX, pixelY);        
-        shadePixelForCircle(circle_id, 
+        shadePixelForCircle(circleStart + i, 
                             pixelCenterNorm, 
-                            circles_positions[circle_id - circleStart], 
-                            circles_radius[circle_id - circleStart], 
+                            circles_positions[i], 
+                            circles_radius[i], 
                             existingColor);
-        continue;
     }
 
     *imgPtr = existingColor;
@@ -988,10 +995,16 @@ __global__ void kernelRenderPixelsWithCache(int num_pixels, int imageWidth, int 
 
 
 void CudaRenderer::render() {
-    int max_circle_per_iterations = 1024;
-    int N = image->width * image->height;
-    dim3 blockDim(max_circle_per_iterations, 1);
-    dim3 gridDim( (N  + blockDim.x - 1) / blockDim.x, 1);
+    // int max_circle_per_iterations = 1024;
+    // int N = image->width * image->height;
+    // dim3 blockDim(max_circle_per_iterations, 1);
+    // dim3 gridDim( (N/max_circle_per_iterations  + blockDim.x - 1) / blockDim.x, 1);
+
+    int max_circle_per_iterations = 32;
+    dim3 blockSize(max_circle_per_iterations, max_circle_per_iterations);
+    dim3 gridSize( (image->width + blockSize.x - 1) / blockSize.x, (image->height + blockSize.y - 1) / blockSize.y);
+
+    printf("== Scene %d - numCircles %d\n", sceneName, numCircles );
 
     // take up the first 1024 circles, update all pixels
     int circleEnd= 0;
@@ -999,8 +1012,8 @@ void CudaRenderer::render() {
         circleEnd = std::min(numCircles, circleStart + max_circle_per_iterations);
 
         // apply the effect of first N circles in increment of 1024 across all pixels
-        printf("Launch kernel for circles from %d to %d\n", circleStart, circleEnd);
-        kernelRenderPixelsWithCache<<<gridDim, blockDim>>>(N, image->width, image->height, circleStart, circleEnd, numCircles);
+        // printf("Launch kernel for circles from %d to %d\n", circleStart, circleEnd);
+        kernelRenderPixelsWithCache<<<gridSize, blockSize>>>(image->width, image->height, circleStart, circleEnd, numCircles);
         // for each blcok                                                  
     }
     
