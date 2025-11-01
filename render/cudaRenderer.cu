@@ -15,10 +15,12 @@
 #include "sceneLoader.h"
 #include "util.h"
 #include "CycleTimer.h"
-
+#include "circleBoxTest.cu_inl"
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
+
+// #define PRINT_DEBUG
 
 #define DEBUG
 
@@ -729,8 +731,8 @@ shadePixelForCircle(int circleIndex, float2 pixelCenter, float3 p, float rad, fl
 
 __global__ void kernelRenderPixels(int width, int height) {
 
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x; //col
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y; // row
 
     if (pixelX > height  || pixelY > width )
         return;
@@ -763,7 +765,7 @@ __global__ void kernelRenderPixels(int width, int height) {
 
 void CudaRenderer::renderPixels() {
     // 256 threads per block is a healthy number
-    dim3 blockSize(16, 16);
+    dim3 blockSize(32, 32);
     dim3 gridSize( (image->width + blockSize.x - 1) / blockSize.x, (image->height + blockSize.y - 1) / blockSize.y);
 
     kernelRenderPixels<<<gridSize, blockSize>>>(image->width, image->height);
@@ -994,7 +996,15 @@ __global__ void kernelRenderPixelsWithCache(int imageWidth, int imageHeight, int
 }
 
 
-void CudaRenderer::render() {
+__device__ __inline__ int current_box(int imageWidth, int imageHeight, int pixelX, int pixelY, int NUM_BOXES_PER_DIM){
+
+    int pixel_per_box_x = imageWidth / NUM_BOXES_PER_DIM;
+    int pixel_per_box_y = imageHeight / NUM_BOXES_PER_DIM;
+
+    return (pixelY / pixel_per_box_y) * NUM_BOXES_PER_DIM + pixelX / pixel_per_box_x;
+}
+
+void CudaRenderer::renderPixelsIncrement() {
     // int max_circle_per_iterations = 1024;
     // int N = image->width * image->height;
     // dim3 blockDim(max_circle_per_iterations, 1);
@@ -1020,3 +1030,341 @@ void CudaRenderer::render() {
     cudaCheckError(cudaDeviceSynchronize())
 }
 
+__global__ void kernelRenderPixelsWithBox(int **circles_for_box, int *num_circles_for_box, int imageWidth, int imageHeight, int NUM_BOXES_PER_DIM) {
+
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x; //col
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y; // row
+
+    if (pixelX > imageWidth || pixelY > imageHeight )
+        return;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 existingColor = *imgPtr;
+
+    // Go through each circle and apply effect
+    int curr_box = current_box(imageWidth, imageHeight, pixelX, pixelY, NUM_BOXES_PER_DIM);
+    // printf("curr_box: %d\n", curr_box);
+
+    for (int i = 0; i < num_circles_for_box[curr_box]; i++){
+        // Get the next circle in the list of circles for the current box
+        int index = circles_for_box[curr_box][i];
+        int index3 = 3 * index;
+
+#ifdef PRINT_DEBUG            
+        if (curr_box == -1){
+            printf("box %d pixelX: %d pixelY: %d apply circle %d effect\n", curr_box, pixelX, pixelY, index);
+        }
+#endif        
+        // read position and radius
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float rad = cuConstRendererParams.radius[index];;
+
+        // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
+        shadePixelForCircle(index, pixelCenterNorm, p, rad, existingColor);
+    }
+    *imgPtr = existingColor;
+
+}
+
+/**
+ * This kernel launches each circle, checks which box this circle intersects with and marks
+ * that in the output `boxes` 
+ */
+__global__ void assignToBlock(int* boxes, int NUM_BOXES_PER_DIM, int PIXELS_IN_BOX_DIM, int numCircles){
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index >= cuConstRendererParams.numCircles)
+        return;
+
+    int index3 = 3 * index;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float radius = cuConstRendererParams.radius[index];
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short imageWidth = cuConstRendererParams.imageWidth;
+
+    // iterator over the boxes
+    for (int i = 0; i< NUM_BOXES_PER_DIM * NUM_BOXES_PER_DIM; i++){
+        // box i has what    
+        int boxL = (i % NUM_BOXES_PER_DIM) * PIXELS_IN_BOX_DIM;
+        int boxR = boxL + PIXELS_IN_BOX_DIM;
+        int boxB = (i / NUM_BOXES_PER_DIM) * PIXELS_IN_BOX_DIM;
+        int boxT = boxB + PIXELS_IN_BOX_DIM;
+                                    
+        int inside = circleInBoxConservative( p.x * imageWidth, p.y * imageHeight , radius* imageWidth,
+                                 1.0 * boxL, 1.0 * boxR,  1.0 *boxT,  1.0 * boxB);
+        // printf("circle %d - p.x %f, p.y: %f, rad %f - boxL:%d, boxR:%d, boxB: %d, boxT: %d - inside? %d\n", index,p.x * imageWidth, p.y* imageHeight, radius*imageWidth, boxL, boxR, boxB, boxT, inside);
+
+        boxes[i * numCircles + index] = inside;
+    }
+}
+
+#define BLOCKSIZE 32
+#define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
+#include "exclusiveScan.cu_inl"
+
+
+/**
+ * SegmentScan the masks for each of the boxes. We can do this BLOCKSIZE
+ * each block does 1 Box
+ *  
+ */
+__global__ void prefixScanBox(int* boxes, int* prefixScan, int num_boxes, int numCircles){
+
+    // int linearThreadIndex =  blockIdx.x * blockDim.x + threadIdx.x;
+
+    __shared__ uint prefixSumInput[BLOCKSIZE];
+    __shared__ uint prefixSumOutput[BLOCKSIZE];
+    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+
+    if (blockIdx.x >= num_boxes )
+        return;
+
+    // int* current_box = &boxes[blockIdx.x * numCircles];    
+    int last_value = 0;
+    // iterate in block size just and copy the values
+    for (int i= 0; i< numCircles; i+= BLOCKSIZE ){
+        __syncthreads();
+        // pick the last value written at the previous iteration which is then used to add up the values from prefix scan
+        // with this value in the nexst iteration
+        if (i > 0)
+            last_value = prefixScan[blockIdx.x * numCircles + i - 1];
+
+#ifdef PRINT_DEBUG     
+        int boxid = 32;       
+        if (blockIdx.x == boxid && i + threadIdx.x < numCircles)
+            printf("box:%d - circle %d - input %d - iter %d\n", blockIdx.x, threadIdx.x, boxes[blockIdx.x * numCircles + (i + threadIdx.x)], i);
+#endif
+
+        if (i + threadIdx.x < numCircles)
+            prefixSumInput[threadIdx.x] = boxes[blockIdx.x * numCircles + (i + threadIdx.x)];
+        else
+            prefixSumInput[threadIdx.x] = 0;
+
+        __syncthreads();
+
+#ifdef PRINT_DEBUG            
+        if (blockIdx.x == boxid && i + threadIdx.x < numCircles)
+            printf("prefixSumInput for box:%d - circle %d - input %d iter %d\n", blockIdx.x, threadIdx.x, prefixSumInput[threadIdx.x], i);
+#endif
+        // printf("Box: %d - iteration %d - threadid: %d\n", blockIdx.x, i, threadIdx.x);
+
+        sharedMemExclusiveScan(threadIdx.x, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
+
+        __syncthreads();
+        // copy prefixSumOutput out
+        if (i + threadIdx.x < numCircles){
+
+            if (threadIdx.x == BLOCKSIZE -1)
+                prefixScan[blockIdx.x * numCircles + i + threadIdx.x] = last_value + prefixSumOutput[threadIdx.x] + boxes[blockIdx.x * numCircles + (i + threadIdx.x)];
+            else
+                prefixScan[blockIdx.x * numCircles + i + threadIdx.x] = last_value + prefixSumOutput[threadIdx.x + 1];
+        }
+#ifdef PRINT_DEBUG            
+        if (blockIdx.x == boxid && i + threadIdx.x < numCircles)
+            printf("box:%d - circle %d - output %d iter %d \n", blockIdx.x, threadIdx.x, prefixSumOutput[threadIdx.x], i);
+#endif
+
+    }
+
+}
+
+__global__ void val(int* input, int index, int *out){
+    int i = blockIdx.x  * blockDim.x  + threadIdx.x;
+
+    if (i == 0){
+        out[0] = input[index];
+    }
+}
+
+__global__ void getMax(int* prefix_scan_boxes_device, int* num_circles_for_box_device, int numCircles, int num_boxes){
+    // 1 thread for each Box 
+    int i = blockIdx.x  * blockDim.x  + threadIdx.x;
+
+    if (i > num_boxes)
+        return;
+
+    num_circles_for_box_device[i] = prefix_scan_boxes_device[(i + 1) * numCircles - 1];
+
+}
+
+__global__ void getCircleListForEachBox(int* boxes_device_mask, int* prefix_scan_boxes_device, int** circles_for_box_out, int* num_circles_for_box, int num_boxes, int nunCircles, int N){
+    // this kernel gather all circles to apply for each box in sequential order
+
+    int index = blockIdx.x  * blockDim.x  + threadIdx.x;
+
+    if (index > N)
+        return;    
+
+    int box = index % num_boxes;
+    int circle = index / num_boxes;
+    // printf("getCircleListForEachBox() - box %d, circle %d, - is set: %d store at: %d\n", box, circle, boxes_device_mask[box * nunCircles + circle], prefix_scan_boxes_device[box * nunCircles + circle] - 1);
+    if (boxes_device_mask[box * nunCircles + circle] == 1){
+        circles_for_box_out[box][prefix_scan_boxes_device[box * nunCircles + circle] - 1] = circle;
+    }
+
+}
+
+
+void CudaRenderer::render() {
+    /**
+     * divide the image into small boxes
+     *  num_box division in each dimension
+     *  -> there num_box ^2 boxes
+     * 2D kernel gives us a natual box division with max of 32 pixel per block
+     *  
+     */ 
+    int THREADS_PER_BLOCK = 1024;
+    
+    // assume same width and heigh dimenseion
+    int NUM_BOXES_PER_DIM = 8;
+    int NUM_BOXES = NUM_BOXES_PER_DIM * NUM_BOXES_PER_DIM;
+    int PIXELS_IN_BOX = image->width * image->height / NUM_BOXES;
+    int PIXELS_IN_BOX_DIM = std::sqrt(PIXELS_IN_BOX);
+
+    dim3 blockSize(THREADS_PER_BLOCK, 1);
+    dim3 gridSize((numCircles + blockSize.x - 1) / blockSize.x, 1);
+
+    int* boxes_device_mask;
+    int* prefix_scan_boxes_device;
+    cudaCheckError(cudaMalloc(&boxes_device_mask, sizeof(int) * NUM_BOXES * numCircles))
+    cudaCheckError(cudaMalloc(&prefix_scan_boxes_device, sizeof(int) * NUM_BOXES * numCircles))
+
+    printf("NumCircles %d - Num Boxes %d, Pixels in Box: %d\n", numCircles, NUM_BOXES, PIXELS_IN_BOX);
+
+    assignToBlock<<<gridSize, blockSize>>>(boxes_device_mask, NUM_BOXES_PER_DIM, PIXELS_IN_BOX_DIM, numCircles);
+    cudaCheckError(cudaDeviceSynchronize())
+
+    dim3 blockSizeScan(SCAN_BLOCK_DIM, 1);
+    dim3 gridSizeScan(NUM_BOXES, 1);
+
+    prefixScanBox<<<gridSizeScan,blockSizeScan>>>(boxes_device_mask, prefix_scan_boxes_device, NUM_BOXES, numCircles);
+    cudaCheckError(cudaDeviceSynchronize())
+
+    // Get max number of circles for each box, allocate memory and copy index of circles
+    int *num_circles_for_box = new int[NUM_BOXES];
+    int *num_circles_for_box_device;
+    cudaCheckError(cudaMalloc(&num_circles_for_box_device, sizeof(int) * NUM_BOXES))
+
+    dim3 blockSizeMax(32, 1);
+    dim3 gridSizeMax((NUM_BOXES + blockSizeMax.x - 1) / blockSizeMax.x, 1);
+
+    getMax<<<gridSizeMax, blockSizeMax>>>(prefix_scan_boxes_device, num_circles_for_box_device, numCircles, NUM_BOXES);
+    cudaCheckError(cudaDeviceSynchronize())
+
+    cudaCheckError(cudaMemcpy(num_circles_for_box, num_circles_for_box_device, NUM_BOXES * sizeof(int), cudaMemcpyDeviceToHost))
+
+#ifdef PRINT_DEBUG
+    for(int i =0; i< NUM_BOXES; i++){
+        printf("Box %d has %d circles intersecting\n", i, num_circles_for_box[i]);
+    }
+#endif
+
+    // Create the actual list of circles for each box
+    int total_circles = 0;
+    for(int i =0; i< NUM_BOXES; i++){
+       total_circles += num_circles_for_box[i];
+    }
+
+    int** circles_for_box = new int*[NUM_BOXES];
+
+    for(int i =0; i< NUM_BOXES; i++){
+        cudaCheckError(cudaMalloc(&circles_for_box[i], sizeof(int) * num_circles_for_box[i]))
+        total_circles += num_circles_for_box[i];
+    }
+
+    // cudaCheckError(cudaMalloc(&circles_for_box, sizeof(int*) * total_circles))
+
+
+    // pb: to index into a specific box, we need to know indexing of all previous box
+
+    dim3 blockSizeGetCircles(32, 1);
+    dim3 gridSizeGetCircles((NUM_BOXES * numCircles + blockSizeGetCircles.x - 1) / blockSizeGetCircles.x, 1);    
+    getCircleListForEachBox<<<gridSizeGetCircles, blockSizeGetCircles>>>(boxes_device_mask, 
+                                                                         prefix_scan_boxes_device,
+                                                                         circles_for_box, 
+                                                                         num_circles_for_box,
+                                                                         NUM_BOXES,
+                                                                         numCircles,
+                                                                         NUM_BOXES * numCircles);
+    cudaCheckError(cudaDeviceSynchronize())
+    
+#ifdef PRINT_DEBUG
+    int boxid = 1;
+    int *box1Circles = new int[num_circles_for_box[boxid]];
+    cudaCheckError(cudaMemcpy(box1Circles, circles_for_box[boxid], num_circles_for_box[boxid] * sizeof(int), cudaMemcpyDeviceToHost))
+    printf("==Box %d circle list: ", boxid);
+    for (int i=0 ; i< num_circles_for_box[boxid]; i++){
+        printf("%d,", box1Circles[i]);
+    }
+    printf("\n");
+    delete [] box1Circles;
+#endif
+
+    // Now that we have the list, launch the kernel for each pixel together with the list of circles for each box
+    dim3 blockSizeFinal(32, 32);
+    dim3 gridSizeFinal( (image->width + blockSizeFinal.x - 1) / blockSizeFinal.x, (image->height + blockSizeFinal.y - 1) / blockSizeFinal.y);
+
+    kernelRenderPixelsWithBox<<<gridSizeFinal, blockSizeFinal>>>(circles_for_box, num_circles_for_box, image->width, image->height, NUM_BOXES_PER_DIM);
+    cudaCheckError(cudaDeviceSynchronize())
+
+#ifdef PRINT_DEBUG
+    // check boxes results
+    int *boxes = new int[NUM_BOXES * numCircles];
+    int *prefix_scan_boxes = new int[NUM_BOXES * numCircles];
+    cudaCheckError(cudaMemcpy(boxes, boxes_device_mask, NUM_BOXES * numCircles * sizeof(int), cudaMemcpyDeviceToHost))
+    cudaCheckError(cudaMemcpy(prefix_scan_boxes, prefix_scan_boxes_device, NUM_BOXES * numCircles * sizeof(int), cudaMemcpyDeviceToHost))
+
+    int num_circles_ = 3;
+    if (true){
+        for (int i = 0; i< NUM_BOXES; i++){
+            // box i has what
+            printf("==Box  %d: ", i);
+            for (int c = 0; c < num_circles_; c++){
+                printf("%d,", boxes[i * numCircles + c]);            
+                // printf("%d,", c);
+
+        }        
+        printf("\n");
+        printf("->Scan %d: ", i);
+            for (int c = 0; c < num_circles_; c++){
+                printf("%d,", prefix_scan_boxes[i * numCircles + c]);            
+                // printf("%d,", c);
+
+        }        
+        printf("\n");
+        }
+    }
+    delete [] boxes;
+    delete [] prefix_scan_boxes;
+#endif
+    
+
+    cudaFree(boxes_device_mask);
+    cudaFree(prefix_scan_boxes_device);
+
+    cudaFree(boxes_device_mask);
+    cudaFree(num_circles_for_box_device);
+    for(int i =0; i< NUM_BOXES; i++){
+        cudaFree(circles_for_box[i]);
+    }
+
+
+    delete [] circles_for_box;
+  
+}
+
+/**
+ * 
+ * 1. assign circles to box
+    -> each box has a list of circles preserved in order
+   2. run per pixel kernel, idenityf which box it's in and which circles to apply
+      .circle order has to be preserved
+ */
