@@ -52,6 +52,11 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
+
+    float invWidth;
+    float invHeight;
+
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -573,6 +578,9 @@ CudaRenderer::setup() {
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
 
+    params.invWidth = 1.f / image->width;
+    params.invHeight = 1.f / image->height;
+
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
     // also need to copy over the noise lookup tables, so we can
@@ -868,22 +876,19 @@ __global__ void kernelRenderPixelsWithBox(int **circles_for_box, int *num_circle
     if (pixelX > imageWidth || pixelY > imageHeight )
         return;
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
     // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float2 pixelCenterNorm = make_float2(cuConstRendererParams.invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                        cuConstRendererParams.invHeight * (static_cast<float>(pixelY) + 0.5f));
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     float4 existingColor = *imgPtr;
 
+    
     // Go through each circle and apply effect
     int curr_box = current_box(imageWidth, imageHeight, pixelX, pixelY, NUM_BOXES_PER_DIM);
 
     for (int i = 0; i < num_circles_for_box[curr_box]; i++){
         // Get the next circle in the list of circles for the current box
         int index = circles_for_box[curr_box][i];
-        int index3 = 3 * index;
 
 #ifdef PRINT_DEBUG            
         if (curr_box == -1){
@@ -891,7 +896,7 @@ __global__ void kernelRenderPixelsWithBox(int **circles_for_box, int *num_circle
         }
 #endif        
         // read position and radius
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * index]);
         float rad = cuConstRendererParams.radius[index];;
 
         // printf("update circle at pixel circle %d, x:%d, y: %d \n", index, pixelX, pixelY);        
@@ -916,7 +921,7 @@ __device__ __inline__ void fill_box_dimensions(int boxid, int NUM_BOXES_PER_DIM,
 __global__ void assignCirclesToBoxes(int* boxes, int NUM_BOXES_PER_DIM, int PIXELS_IN_BOX_DIM, int numCircles){
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (index >= cuConstRendererParams.numCircles)
+    if (index >= numCircles)
         return;
 
     int index3 = 3 * index;
@@ -939,6 +944,42 @@ __global__ void assignCirclesToBoxes(int* boxes, int NUM_BOXES_PER_DIM, int PIXE
         boxes[i * numCircles + index] = inside;
     }
 }
+
+/**
+ * This kernel launches each circle, checks which box this circle intersects with and marks
+ * that in the output `boxes` 
+ */
+__global__ void assignCirclesToBoxesFaster(int* boxes, int NUM_BOXES_PER_DIM, int PIXELS_IN_BOX_DIM, int numCircles){
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int num_boxes = NUM_BOXES_PER_DIM * NUM_BOXES_PER_DIM;
+    if (index > numCircles * num_boxes)
+        return;
+
+    int box_id = index / numCircles;
+    int circle_index = index % numCircles;
+    
+    
+    int circle_index3 = 3 * circle_index;
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[circle_index3]);
+    float radius = cuConstRendererParams.radius[circle_index];
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short imageWidth = cuConstRendererParams.imageWidth;
+
+    // iterator over the boxes
+
+    int boxL, boxR, boxB, boxT;
+    fill_box_dimensions(box_id, NUM_BOXES_PER_DIM, PIXELS_IN_BOX_DIM, boxL, boxR, boxB, boxT);
+                                
+    int inside = circleInBoxConservative( p.x * imageWidth, p.y * imageHeight , radius* imageWidth,
+                                1.0 * boxL, 1.0 * boxR,  1.0 *boxT,  1.0 * boxB);
+    // printf("circle %d - p.x %f, p.y: %f, rad %f - boxL:%d, boxR:%d, boxB: %d, boxT: %d - inside? %d\n", 
+    //     index,p.x * imageWidth, p.y* imageHeight, radius*imageWidth, boxL, boxR, boxB, boxT, inside);
+    boxes[box_id * numCircles + circle_index] = inside;    
+}
+
+
 
 #define BLOCKSIZE 32
 #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
@@ -1090,6 +1131,8 @@ void CudaRenderer::renderBox() {
     int THREADS_PER_BLOCK = 1024;    
     // assume same width and heigh dimenseion
     int NUM_BOXES_PER_DIM = 8;
+    if (numCircles >=100000)
+        NUM_BOXES_PER_DIM = 16;
     int NUM_BOXES = NUM_BOXES_PER_DIM * NUM_BOXES_PER_DIM;
     int PIXELS_IN_BOX = image->width * image->height / NUM_BOXES;
     int PIXELS_IN_BOX_DIM = std::sqrt(PIXELS_IN_BOX);
@@ -1103,15 +1146,15 @@ void CudaRenderer::renderBox() {
 
     /********************************
      * LAUNCH KERNEL: assignCirclesToBoxes
-     ********************************/
+     ********************************/   
     start = CycleTimer::currentSeconds();
-    dim3 blockSize(THREADS_PER_BLOCK, 1);
-    dim3 gridSize((numCircles + blockSize.x - 1) / blockSize.x, 1);
-    assignCirclesToBoxes<<<gridSize, blockSize>>>(boxes_device_mask_device, NUM_BOXES_PER_DIM, PIXELS_IN_BOX_DIM, numCircles);
+    dim3 blockSize(256, 1);
+    dim3 gridSize((numCircles*NUM_BOXES + blockSize.x - 1) / blockSize.x, 1);
+    assignCirclesToBoxesFaster<<<gridSize, blockSize>>>(boxes_device_mask_device, NUM_BOXES_PER_DIM, PIXELS_IN_BOX_DIM, numCircles);
     cudaCheckError(cudaDeviceSynchronize())
     end = CycleTimer::currentSeconds();
-    printf("%.03fms - KERNEL[assignCirclesToBoxes]\n", (end - start) * 1000);
-
+    printf("%.03fms - KERNEL[assignCirclesToBoxesFaster]\n", (end - start) * 1000);
+    
     /************************************************************
      * LAUNCH KERNEL: computePrefixScanOverCircleMasksForEachBox
      ************************************************************/
@@ -1179,8 +1222,6 @@ void CudaRenderer::renderBox() {
     cudaCheckError(cudaDeviceSynchronize())
     end = CycleTimer::currentSeconds();
     printf("%.03fms - KERNEL[getCircleListForEachBox]\n", (end - start) * 1000);
-
-    printf("Done with circle list!\n");
     
 #ifdef PRINT_DEBUG
     int boxid = 42;
@@ -1196,13 +1237,23 @@ void CudaRenderer::renderBox() {
 
     // Now that we have the list, launch the kernel for each pixel together with the list of circles for each box
 
+    float invWidth = 1.f / image->width;
+    float invHeight = 1.f / image->height;
     /**********************************************
      * LAUNCH KERNEL: kernelRenderPixelsWithBox
      *********************************************/
+    start = CycleTimer::currentSeconds();
     dim3 blockSizeFinal(32, 32);
     dim3 gridSizeFinal( (image->width + blockSizeFinal.x - 1) / blockSizeFinal.x, (image->height + blockSizeFinal.y - 1) / blockSizeFinal.y);
-    kernelRenderPixelsWithBox<<<gridSizeFinal, blockSizeFinal>>>(circles_for_box_device, num_circles_for_box_device, image->width, image->height, NUM_BOXES_PER_DIM);
+    kernelRenderPixelsWithBox<<<gridSizeFinal, blockSizeFinal>>>(circles_for_box_device, 
+                                                                 num_circles_for_box_device,
+                                                                 image->width, 
+                                                                 image->height,
+                                                                 NUM_BOXES_PER_DIM
+                                                                 );
     cudaCheckError(cudaDeviceSynchronize())
+    end = CycleTimer::currentSeconds();
+    printf("%.03fms - KERNEL[kernelRenderPixelsWithBox]\n", (end - start) * 1000);
 
 #ifdef PRINT_DEBUG
     // check boxes results
@@ -1235,7 +1286,8 @@ void CudaRenderer::renderBox() {
     delete [] prefix_scan_boxes;
 #endif
     
-    printf("Done! free ressources\n");
+    start = CycleTimer::currentSeconds();
+
     cudaFree(boxes_device_mask_device);
     cudaFree(prefix_scan_boxes_device);
     cudaFree(num_circles_for_box_device);
@@ -1244,14 +1296,24 @@ void CudaRenderer::renderBox() {
     }
     cudaFree(circles_for_box_device);
     delete [] circle_ptr_array_host;
+
+    end = CycleTimer::currentSeconds();
+    printf("%.03fms - Free Resources\n", (end - start) * 1000);
+
 }
 
 
 void CudaRenderer::render() {
+    double start = CycleTimer::currentSeconds();
 
     if (numCircles < 10){
         renderPixels();
     } else {
         renderBox();
     }
+
+    double end = CycleTimer::currentSeconds();
+    printf("%.03fms - Render Total\n", (end - start) * 1000);
+
+
 }
