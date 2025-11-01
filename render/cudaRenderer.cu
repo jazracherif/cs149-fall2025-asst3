@@ -1049,7 +1049,6 @@ __global__ void kernelRenderPixelsWithBox(int **circles_for_box, int *num_circle
 
     // Go through each circle and apply effect
     int curr_box = current_box(imageWidth, imageHeight, pixelX, pixelY, NUM_BOXES_PER_DIM);
-    // printf("curr_box: %d\n", curr_box);
 
     for (int i = 0; i < num_circles_for_box[curr_box]; i++){
         // Get the next circle in the list of circles for the current box
@@ -1205,9 +1204,17 @@ __global__ void getCircleListForEachBox(int* boxes_device_mask, int* prefix_scan
 
     int box = index % num_boxes;
     int circle = index / num_boxes;
+
+#ifdef PRINT_DEBUG    
     // printf("getCircleListForEachBox() - box %d, circle %d, - is set: %d store at: %d\n", box, circle, boxes_device_mask[box * nunCircles + circle], prefix_scan_boxes_device[box * nunCircles + circle] - 1);
+#endif
+
     if (boxes_device_mask[box * nunCircles + circle] == 1){
+        // printf("%d\n", prefix_scan_boxes_device[box * nunCircles + circle] - 1);
         circles_for_box_out[box][prefix_scan_boxes_device[box * nunCircles + circle] - 1] = circle;
+        
+        // printf("box %d: circle %d at %d\n", box, circles_for_box_out[box][prefix_scan_boxes_device[box * nunCircles + circle] - 1], prefix_scan_boxes_device[box * nunCircles + circle] - 1);
+
     }
 
 }
@@ -1273,12 +1280,25 @@ void CudaRenderer::render() {
        total_circles += num_circles_for_box[i];
     }
 
-    int** circles_for_box = new int*[NUM_BOXES];
+    // int** circles_for_box = new int*[NUM_BOXES];
+    int** circles_for_box;
+    cudaCheckError(cudaMalloc((void**)&circles_for_box, NUM_BOXES * sizeof(int*)))
 
-    for(int i =0; i< NUM_BOXES; i++){
-        cudaCheckError(cudaMalloc(&circles_for_box[i], sizeof(int) * num_circles_for_box[i]))
-        total_circles += num_circles_for_box[i];
+    int** h_ptr_array = new int*[NUM_BOXES]; // create array of points on the host side
+
+    for (int i = 0; i < NUM_BOXES; ++i) {
+        cudaCheckError(cudaMalloc((void**)&(h_ptr_array[i]), num_circles_for_box[i] * sizeof(int)))
     }
+
+    // Copy the host-side array of device pointers to the device
+    cudaCheckError(cudaMemcpy(circles_for_box, h_ptr_array, NUM_BOXES * sizeof(int*), cudaMemcpyHostToDevice))
+    
+    // for(int i =0; i< NUM_BOXES; i++){
+    //     cudaCheckError(cudaMalloc((int**)&temp_ptr, num_circles_for_box[i] * sizeof(int)))
+    //     cudaCheckError(cudaMemcpy(&circles_for_box[i], &temp_ptr, sizeof(int*), cudaMemcpyHostToDevice))
+    //     // cudaCheckError(cudaMalloc(&circles_for_box[i], sizeof(int) * num_circles_for_box[i]))
+    //     total_circles += num_circles_for_box[i];
+    // }
 
     // cudaCheckError(cudaMalloc(&circles_for_box, sizeof(int*) * total_circles))
 
@@ -1290,16 +1310,18 @@ void CudaRenderer::render() {
     getCircleListForEachBox<<<gridSizeGetCircles, blockSizeGetCircles>>>(boxes_device_mask, 
                                                                          prefix_scan_boxes_device,
                                                                          circles_for_box, 
-                                                                         num_circles_for_box,
+                                                                         num_circles_for_box_device,
                                                                          NUM_BOXES,
                                                                          numCircles,
                                                                          NUM_BOXES * numCircles);
     cudaCheckError(cudaDeviceSynchronize())
     
+    printf("Done with circle list!\n");
+    
 #ifdef PRINT_DEBUG
-    int boxid = 1;
+    int boxid = 42;
     int *box1Circles = new int[num_circles_for_box[boxid]];
-    cudaCheckError(cudaMemcpy(box1Circles, circles_for_box[boxid], num_circles_for_box[boxid] * sizeof(int), cudaMemcpyDeviceToHost))
+    cudaCheckError(cudaMemcpy(box1Circles, h_ptr_array[boxid], num_circles_for_box[boxid] * sizeof(int), cudaMemcpyDeviceToHost))
     printf("==Box %d circle list: ", boxid);
     for (int i=0 ; i< num_circles_for_box[boxid]; i++){
         printf("%d,", box1Circles[i]);
@@ -1312,7 +1334,7 @@ void CudaRenderer::render() {
     dim3 blockSizeFinal(32, 32);
     dim3 gridSizeFinal( (image->width + blockSizeFinal.x - 1) / blockSizeFinal.x, (image->height + blockSizeFinal.y - 1) / blockSizeFinal.y);
 
-    kernelRenderPixelsWithBox<<<gridSizeFinal, blockSizeFinal>>>(circles_for_box, num_circles_for_box, image->width, image->height, NUM_BOXES_PER_DIM);
+    kernelRenderPixelsWithBox<<<gridSizeFinal, blockSizeFinal>>>(circles_for_box, num_circles_for_box_device, image->width, image->height, NUM_BOXES_PER_DIM);
     cudaCheckError(cudaDeviceSynchronize())
 
 #ifdef PRINT_DEBUG
@@ -1346,18 +1368,21 @@ void CudaRenderer::render() {
     delete [] prefix_scan_boxes;
 #endif
     
+    printf("Done! free ressources\n");
 
     cudaFree(boxes_device_mask);
     cudaFree(prefix_scan_boxes_device);
 
     cudaFree(boxes_device_mask);
     cudaFree(num_circles_for_box_device);
+
+
     for(int i =0; i< NUM_BOXES; i++){
-        cudaFree(circles_for_box[i]);
+        cudaFree(h_ptr_array[i]);
     }
 
-
-    delete [] circles_for_box;
+    cudaFree(circles_for_box);
+    delete [] h_ptr_array;
   
 }
 
