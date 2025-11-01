@@ -40,7 +40,7 @@ class CudaRenderer : public CircleRenderer {
   void renderPixels();
   void renderPixelsIncrement();
   void render();
-  // void renderWithBlocks();
+  void renderBox();
 
   void shadePixel(int circleIndex, float pixelCenterX, float pixelCenterY,
                   float px, float py, float pz, float* pixelData);
