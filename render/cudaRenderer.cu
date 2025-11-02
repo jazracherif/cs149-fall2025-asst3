@@ -1128,8 +1128,6 @@ void CudaRenderer::renderBox() {
     
     printf("==renderBox \n");
 
-    int THREADS_PER_BLOCK = 1024;    
-    // assume same width and heigh dimenseion
     int NUM_BOXES_PER_DIM = 8;
     if (numCircles >=100000)
         NUM_BOXES_PER_DIM = 16;
@@ -1148,7 +1146,7 @@ void CudaRenderer::renderBox() {
      * LAUNCH KERNEL: assignCirclesToBoxes
      ********************************/   
     start = CycleTimer::currentSeconds();
-    dim3 blockSize(256, 1);
+    dim3 blockSize(32, 1);
     dim3 gridSize((numCircles*NUM_BOXES + blockSize.x - 1) / blockSize.x, 1);
     assignCirclesToBoxesFaster<<<gridSize, blockSize>>>(boxes_device_mask_device, NUM_BOXES_PER_DIM, PIXELS_IN_BOX_DIM, numCircles);
     cudaCheckError(cudaDeviceSynchronize())
@@ -1199,13 +1197,16 @@ void CudaRenderer::renderBox() {
      * 2. create host list of array pointers
      * 3. copy the list of array pointers over the overall device pointer created in 1. 
      */ 
+    start = CycleTimer::currentSeconds();
     int** circles_for_box_device;
     cudaCheckError(cudaMalloc((void**)&circles_for_box_device, NUM_BOXES * sizeof(int*)))
     int** circle_ptr_array_host = new int*[NUM_BOXES];
     for (int i = 0; i < NUM_BOXES; ++i)
         cudaCheckError(cudaMalloc((void**)&(circle_ptr_array_host[i]), num_circles_for_box[i] * sizeof(int)))
     cudaCheckError(cudaMemcpy(circles_for_box_device, circle_ptr_array_host, NUM_BOXES * sizeof(int*), cudaMemcpyHostToDevice))
-        
+    end = CycleTimer::currentSeconds();
+    printf("%.03fms - CudaMalloc for boxe circle lists\n", (end - start) * 1000);
+
     /**********************************************
      * LAUNCH KERNEL: getCircleListForEachBox
      *********************************************/

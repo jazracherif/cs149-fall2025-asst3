@@ -71,7 +71,7 @@ $(OBJDIR)/%.o: %.cu
 
 
 profile:
-	  nsys profile --stats=true -t nvtx,cuda -o ./reports/render_report ./render rand10k
+	  nsys profile --stats=true -t nvtx,cuda -o ./reports/render_report ./render pattern
 
 nsight_compute:
-	  sudo /usr/local/cuda/bin/ncu -o ./reports/kernel_render_report ./render rand10k
+	  sudo /usr/local/cuda/bin/ncu -o ./reports/kernel_render_report ./render pattern
