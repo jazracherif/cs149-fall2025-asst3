@@ -868,7 +868,7 @@ void CudaRenderer::renderPixelsIncrement() {
     cudaCheckError(cudaDeviceSynchronize())
 }
 
-__global__ void kernelRenderPixelsWithBox(int **circles_for_box, int *num_circles_for_box, int imageWidth, int imageHeight, int NUM_BOXES_PER_DIM) {
+__global__ void kernelRenderPixelsWithBox(int *circles_for_box, int *circles_start_for_box_device, int num_total_circles, int imageWidth, int imageHeight, int NUM_BOXES_PER_DIM) {
 
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x; //col
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y; // row
@@ -876,7 +876,6 @@ __global__ void kernelRenderPixelsWithBox(int **circles_for_box, int *num_circle
     if (pixelX > imageWidth || pixelY > imageHeight )
         return;
 
-    // printf("update  pixel x:%d, y: %d \n", pixelX, pixelY);
     float2 pixelCenterNorm = make_float2(cuConstRendererParams.invWidth * (static_cast<float>(pixelX) + 0.5f),
                                         cuConstRendererParams.invHeight * (static_cast<float>(pixelY) + 0.5f));
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
@@ -886,9 +885,18 @@ __global__ void kernelRenderPixelsWithBox(int **circles_for_box, int *num_circle
     // Go through each circle and apply effect
     int curr_box = current_box(imageWidth, imageHeight, pixelX, pixelY, NUM_BOXES_PER_DIM);
 
-    for (int i = 0; i < num_circles_for_box[curr_box]; i++){
+    int num_circles = -1;
+    // The number of circle for the last box requires diffing against the total number
+    // of circles for all boxes
+    if (curr_box == NUM_BOXES_PER_DIM * NUM_BOXES_PER_DIM - 1)
+        num_circles = num_total_circles - circles_start_for_box_device[curr_box];
+    else
+        num_circles = circles_start_for_box_device[curr_box+1] - circles_start_for_box_device[curr_box];
+
+
+    for (int i = 0; i < num_circles; i++){
         // Get the next circle in the list of circles for the current box
-        int index = circles_for_box[curr_box][i];
+        int index = circles_for_box[circles_start_for_box_device[curr_box] + i];
 
 #ifdef PRINT_DEBUG            
         if (curr_box == -1){
@@ -1073,7 +1081,7 @@ __global__ void getNumOverlappingCirclesForEachBox(int* prefix_scan_boxes_device
 
 }
 
-__global__ void getCircleListForEachBox(int* boxes_device_mask, int* prefix_scan_boxes_device, int** circles_for_box_out, int* num_circles_for_box, int num_boxes, int nunCircles, int N){
+__global__ void getCircleListForEachBox(int* boxes_device_mask, int* prefix_scan_boxes_device, int* circles_for_box_out, int* circles_start_for_box_device, int num_boxes, int nunCircles, int N){
     // this kernel gather all circles to apply for each box in sequential order
 
     int index = blockIdx.x  * blockDim.x  + threadIdx.x;
@@ -1090,9 +1098,16 @@ __global__ void getCircleListForEachBox(int* boxes_device_mask, int* prefix_scan
 
     if (boxes_device_mask[box * nunCircles + circle] == 1){
         // printf("%d\n", prefix_scan_boxes_device[box * nunCircles + circle] - 1);
-        circles_for_box_out[box][prefix_scan_boxes_device[box * nunCircles + circle] - 1] = circle;
-        
-        // printf("box %d: circle %d at %d\n", box, circles_for_box_out[box][prefix_scan_boxes_device[box * nunCircles + circle] - 1], prefix_scan_boxes_device[box * nunCircles + circle] - 1);
+        circles_for_box_out[circles_start_for_box_device[box] + prefix_scan_boxes_device[box * nunCircles + circle] - 1] = circle;
+  
+#ifdef PRINT_DEBUG    
+        printf("box %d, starts at: %d, num_circles %d, circle %d at %d\n",
+                 box,
+                 circles_start_for_box_device[box],
+                 circles_start_for_box_device[box+1] - circles_start_for_box_device[box],
+                 circles_for_box_out[circles_start_for_box_device[box] + prefix_scan_boxes_device[box * nunCircles + circle] - 1], 
+                 prefix_scan_boxes_device[box * nunCircles + circle] - 1);
+#endif
 
     }
 
@@ -1192,18 +1207,33 @@ void CudaRenderer::renderBox() {
 #endif
 
     /**
-     * Create a list of list pointers, top level for each box, and second level for the circle list
-     * 1. create overall device pointer for array
-     * 2. create host list of array pointers
-     * 3. copy the list of array pointers over the overall device pointer created in 1. 
+     * `circles_for_box_device`: contigous memory identify list of circles for each box.
+     * `circles_start_for_box`: the list of start location in `circles_for_box_device`
+     *  for each of the boxes list of circles. The number of circles for a box is the
+     *  the difference between the start idx of the next box and the current box.
+     * 
      */ 
     start = CycleTimer::currentSeconds();
-    int** circles_for_box_device;
-    cudaCheckError(cudaMalloc((void**)&circles_for_box_device, NUM_BOXES * sizeof(int*)))
-    int** circle_ptr_array_host = new int*[NUM_BOXES];
-    for (int i = 0; i < NUM_BOXES; ++i)
-        cudaCheckError(cudaMalloc((void**)&(circle_ptr_array_host[i]), num_circles_for_box[i] * sizeof(int)))
-    cudaCheckError(cudaMemcpy(circles_for_box_device, circle_ptr_array_host, NUM_BOXES * sizeof(int*), cudaMemcpyHostToDevice))
+    int *circles_start_for_box = new int[NUM_BOXES];
+    circles_start_for_box[0] = 0;
+    int num_total_circles = num_circles_for_box[0];
+    for (int i= 1; i< NUM_BOXES; i++){
+        circles_start_for_box[i] = circles_start_for_box[i-1] + num_circles_for_box[i-1];
+        num_total_circles += num_circles_for_box[i];
+    }
+
+#ifdef PRINT_DEBUG
+    for (int i= 0; i< NUM_BOXES; i++)
+        printf("box: %d - starts at %d - num circles: %d\n", i, circles_start_for_box[i], num_circles_for_box[i]);
+#endif
+
+    int *circles_for_box_device;
+    cudaCheckError(cudaMalloc(&circles_for_box_device, num_total_circles * sizeof(int*)))
+
+    int *circles_start_for_box_device;
+    cudaCheckError(cudaMalloc(&circles_start_for_box_device, NUM_BOXES  * sizeof(int*)))
+    cudaCheckError(cudaMemcpy(circles_start_for_box_device, circles_start_for_box, NUM_BOXES * sizeof(int), cudaMemcpyHostToDevice))
+
     end = CycleTimer::currentSeconds();
     printf("%.03fms - CudaMalloc for boxe circle lists\n", (end - start) * 1000);
 
@@ -1216,7 +1246,7 @@ void CudaRenderer::renderBox() {
     getCircleListForEachBox<<<gridSizeGetCircles, blockSizeGetCircles>>>(boxes_device_mask_device, 
                                                                          prefix_scan_boxes_device,
                                                                          circles_for_box_device, 
-                                                                         num_circles_for_box_device,
+                                                                         circles_start_for_box_device,
                                                                          NUM_BOXES,
                                                                          numCircles,
                                                                          NUM_BOXES * numCircles);
@@ -1224,17 +1254,6 @@ void CudaRenderer::renderBox() {
     end = CycleTimer::currentSeconds();
     printf("%.03fms - KERNEL[getCircleListForEachBox]\n", (end - start) * 1000);
     
-#ifdef PRINT_DEBUG
-    int boxid = 42;
-    int *box1Circles = new int[num_circles_for_box[boxid]];
-    cudaCheckError(cudaMemcpy(box1Circles, circle_ptr_array_host[boxid], num_circles_for_box[boxid] * sizeof(int), cudaMemcpyDeviceToHost))
-    printf("==Box %d circle list: ", boxid);
-    for (int i=0 ; i< num_circles_for_box[boxid]; i++){
-        printf("%d,", box1Circles[i]);
-    }
-    printf("\n");
-    delete [] box1Circles;
-#endif
 
     // Now that we have the list, launch the kernel for each pixel together with the list of circles for each box
 
@@ -1247,7 +1266,8 @@ void CudaRenderer::renderBox() {
     dim3 blockSizeFinal(32, 32);
     dim3 gridSizeFinal( (image->width + blockSizeFinal.x - 1) / blockSizeFinal.x, (image->height + blockSizeFinal.y - 1) / blockSizeFinal.y);
     kernelRenderPixelsWithBox<<<gridSizeFinal, blockSizeFinal>>>(circles_for_box_device, 
-                                                                 num_circles_for_box_device,
+                                                                 circles_start_for_box_device,
+                                                                 num_total_circles,
                                                                  image->width, 
                                                                  image->height,
                                                                  NUM_BOXES_PER_DIM
@@ -1292,11 +1312,10 @@ void CudaRenderer::renderBox() {
     cudaFree(boxes_device_mask_device);
     cudaFree(prefix_scan_boxes_device);
     cudaFree(num_circles_for_box_device);
-    for(int i =0; i< NUM_BOXES; i++){
-        cudaFree(circle_ptr_array_host[i]);
-    }
+    cudaFree(circles_start_for_box_device);
     cudaFree(circles_for_box_device);
-    delete [] circle_ptr_array_host;
+    delete [] circles_start_for_box;
+    delete [] num_circles_for_box;
 
     end = CycleTimer::currentSeconds();
     printf("%.03fms - Free Resources\n", (end - start) * 1000);
