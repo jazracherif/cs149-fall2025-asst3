@@ -945,7 +945,7 @@ __global__ void assignCirclesToBoxes(int* boxes, int NUM_BOXES_PER_DIM, int PIXE
     for (int i = 0; i< NUM_BOXES_PER_DIM * NUM_BOXES_PER_DIM; i++){
         fill_box_dimensions(i, NUM_BOXES_PER_DIM, PIXELS_IN_BOX_DIM, boxL, boxR, boxB, boxT);
                                     
-        int inside = circleInBoxConservative( p.x * imageWidth, p.y * imageHeight , radius* imageWidth,
+        int inside = circleInBox( p.x * imageWidth, p.y * imageHeight , radius* imageWidth,
                                  1.0 * boxL, 1.0 * boxR,  1.0 *boxT,  1.0 * boxB);
         // printf("circle %d - p.x %f, p.y: %f, rad %f - boxL:%d, boxR:%d, boxB: %d, boxT: %d - inside? %d\n", 
         //     index,p.x * imageWidth, p.y* imageHeight, radius*imageWidth, boxL, boxR, boxB, boxT, inside);
@@ -1101,12 +1101,12 @@ __global__ void getCircleListForEachBox(int* boxes_device_mask, int* prefix_scan
         circles_for_box_out[circles_start_for_box_device[box] + prefix_scan_boxes_device[box * nunCircles + circle] - 1] = circle;
   
 #ifdef PRINT_DEBUG    
-        printf("box %d, starts at: %d, num_circles %d, circle %d at %d\n",
-                 box,
-                 circles_start_for_box_device[box],
-                 circles_start_for_box_device[box+1] - circles_start_for_box_device[box],
-                 circles_for_box_out[circles_start_for_box_device[box] + prefix_scan_boxes_device[box * nunCircles + circle] - 1], 
-                 prefix_scan_boxes_device[box * nunCircles + circle] - 1);
+        // printf("box %d, starts at: %d, num_circles %d, circle %d at %d\n",
+        //          box,
+        //          circles_start_for_box_device[box],
+        //          circles_start_for_box_device[box+1] - circles_start_for_box_device[box],
+        //          circles_for_box_out[circles_start_for_box_device[box] + prefix_scan_boxes_device[box * nunCircles + circle] - 1], 
+        //          prefix_scan_boxes_device[box * nunCircles + circle] - 1);
 #endif
 
     }
